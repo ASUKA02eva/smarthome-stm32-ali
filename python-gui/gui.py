@@ -1,6 +1,3 @@
-
-from flask import Flask, jsonify
-from flask_cors import CORS
 import socket
 import threading
 import time
@@ -8,11 +5,6 @@ import re
 import tkinter as tk
 from tkinter import ttk
 from ttkthemes import ThemedTk
-
-app = Flask(__name__)
-
-# 启用 CORS，允许所有来源访问
-CORS(app, resources={r"/*": {"origins": "*"}})
 
 # 全局变量存储温度和湿度数据
 temperature = 0.0
@@ -23,9 +15,9 @@ last_data = '无数据'
 # 添加线程锁以确保线程安全
 lock = threading.Lock()
 
-# 服务器信息
-server_host = '118.178.143.157'
-server_port = 8002
+# 服务器信息（注意：这里端口改为与C程序匹配的8001）
+server_host = '127.0.0.1'  # 请根据实际情况修改服务器IP
+server_port = 8001
 
 # 创建TCP套接字
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -67,6 +59,10 @@ def receive_temperature():
                 with lock:
                     connection_status = '服务器断开'
                 print("服务器断开连接，尝试重新连接...")
+                # 关闭旧套接字并创建新的
+                sock.close()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
                 if not connect_to_server():
                     time.sleep(5)
                 continue
@@ -85,8 +81,8 @@ def receive_temperature():
                 except Exception as e:
                     print(f"温度解析错误: {str(e)}")
 
-            # 使用正则表达式提取湿度值
-            match_hum = re.search(r'Hum:\s*([\d.]+)C', data)
+            # 使用正则表达式提取湿度值（修正了正则，去掉了错误的C单位）
+            match_hum = re.search(r'Hum:\s*([\d.]+)', data)
             if match_hum:
                 try:
                     with lock:
@@ -101,6 +97,13 @@ def receive_temperature():
             print(f"套接字错误: {str(e)}")
             with lock:
                 connection_status = f'套接字错误: {str(e)}'
+            # 尝试重连
+            try:
+                sock.close()
+            except:
+                pass
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
             if not connect_to_server():
                 time.sleep(5)
         except Exception as e:
@@ -108,18 +111,6 @@ def receive_temperature():
             with lock:
                 connection_status = f'错误: {str(e)}'
             time.sleep(1)
-
-@app.route('/get_temperature')
-def get_temperature():
-    """获取最新温度和湿度数据"""
-    with lock:
-        print(f"返回温度: {temperature}°C, 湿度: {humidity}%")  # 调试输出
-        return jsonify({
-            'temperature': temperature,
-            'humidity': humidity,
-            'connection': connection_status,
-            'last_data': last_data
-        })
 
 def create_gui():
     """创建并运行 tkinter GUI"""
@@ -237,10 +228,5 @@ if __name__ == '__main__':
     recv_thread = threading.Thread(target=receive_temperature, daemon=True)
     recv_thread.start()
 
-    # 启动 Flask 线程
-    flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False), daemon=True)
-    flask_thread.start()
-
     # 启动 GUI（主线程）
     create_gui()
-

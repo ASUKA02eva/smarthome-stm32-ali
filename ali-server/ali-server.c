@@ -5,41 +5,44 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 
-#define PORT 8000
-#define WEB_PORT 8002
+#define PORT 8000        // 单片机连接端口
+#define GUI_PORT 8001    // Python GUI连接端口
 #define BUF_SIZE 1024
 
-int device_fd = -1;
-int web_fd = -1;
-pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+int device_fd = -1;      // 单片机连接文件描述符
+int gui_fd = -1;         // GUI连接文件描述符
+pthread_mutex_t gui_lock = PTHREAD_MUTEX_INITIALIZER;  // GUI连接互斥锁
 
 float current_temp = 0.0;
 float current_hum = 0.0;
-// 发送数据到Web
-void send_to_web(const char* data) {
-    pthread_mutex_lock(&lock);
-    if (web_fd != -1) {
-        // 直接转发单片机原始数据
-        send(web_fd, data, strlen(data), 0);
-        printf("Sent to Web: %s", data);
+
+// 发送数据到Python GUI
+void send_to_gui(const char* data) {
+    pthread_mutex_lock(&gui_lock);
+    if (gui_fd != -1) {
+        send(gui_fd, data, strlen(data), 0);
+        printf("Sent to GUI: %s", data);
     }
-    pthread_mutex_unlock(&lock);
+    pthread_mutex_unlock(&gui_lock);
 }
-// 解析设备数据
+
+// 解析设备数据（修正了原逻辑错误）
 void parse_device_data(const char* data) {
     // 解析温度数据
     if (strstr(data, "Tem:") != NULL) {
-        // 修正解析格式：包含换行符
         if (sscanf(data, "Tem: %fC\n", &current_temp) == 1) {
             printf("Parsed temperature: %.1f°C\n", current_temp);
         }
-        if(sscanf(data,"Hum:%fC\n",&current_hum)==1){
-            print("Parsed humadity:%.1f\n",current_hum);
+    }
+    // 解析湿度数据（独立判断，修正格式）
+    if (strstr(data, "Hum:") != NULL) {
+        if (sscanf(data, "Hum: %f\n", &current_hum) == 1) {
+            printf("Parsed humidity: %.1f\n", current_hum);
         }
     }
 }
 
-// 接收线程
+// 接收单片机数据的线程
 void *recv_thread(void *arg) {
     int client_fd = *(int *)arg;
     char buf[BUF_SIZE];
@@ -52,47 +55,73 @@ void *recv_thread(void *arg) {
         // 解析数据
         parse_device_data(buf);
 
-        // 直接转发原始数据到Web
-        send_to_web(buf);
+        // 转发原始数据到Python GUI
+        send_to_gui(buf);
     }
 
     pthread_exit(NULL);
 }
-// 初始化Web服务器
-int init_web_server() {
-    int web_server_fd;
-    struct sockaddr_in web_addr;
 
-    web_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (web_server_fd < 0) {
-        perror("web socket");
+// 接收Python GUI数据的线程
+void *gui_recv_thread(void *arg) {
+    char buf[BUF_SIZE];
+    ssize_t n;
+
+    while ((n = recv(gui_fd, buf, BUF_SIZE - 1, 0)) > 0) {
+        buf[n] = '\0';
+        printf("Received from GUI: %s", buf);
+
+        // 将GUI命令转发给单片机
+        if (device_fd != -1) {
+            send(device_fd, buf, strlen(buf), 0);
+            printf("Sent to Device: %s", buf);
+        }
+    }
+
+    // GUI断开连接处理
+    pthread_mutex_lock(&gui_lock);
+    gui_fd = -1;
+    pthread_mutex_unlock(&gui_lock);
+    printf("GUI disconnected\n");
+    pthread_exit(NULL);
+}
+
+// 初始化GUI服务器
+int init_gui_server() {
+    int gui_server_fd;
+    struct sockaddr_in gui_addr;
+
+    gui_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (gui_server_fd < 0) {
+        perror("gui socket");
         return -1;
     }
 
     int opt = 1;
-    setsockopt(web_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(gui_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    memset(&web_addr, 0, sizeof(web_addr));
-    web_addr.sin_family = AF_INET;
-    web_addr.sin_addr.s_addr = INADDR_ANY;
-    web_addr.sin_port = htons(WEB_PORT);
+    memset(&gui_addr, 0, sizeof(gui_addr));
+    gui_addr.sin_family = AF_INET;
+    gui_addr.sin_addr.s_addr = INADDR_ANY;
+    gui_addr.sin_port = htons(GUI_PORT);
 
-    if (bind(web_server_fd, (struct sockaddr*)&web_addr, sizeof(web_addr)) < 0) {
-        perror("web bind");
-        close(web_server_fd);
+    if (bind(gui_server_fd, (struct sockaddr*)&gui_addr, sizeof(gui_addr)) < 0) {
+        perror("gui bind");
+        close(gui_server_fd);
         return -1;
     }
 
-    if (listen(web_server_fd, 5) < 0) {
-        perror("web listen");
-        close(web_server_fd);
+    if (listen(gui_server_fd, 5) < 0) {
+        perror("gui listen");
+        close(gui_server_fd);
         return -1;
-    } printf("Web server listening on port %d...\n", WEB_PORT);
-    return web_server_fd;
+    }
+    printf("GUI server listening on port %d...\n", GUI_PORT);
+    return gui_server_fd;
 }
 
 int main() {
-    int server_fd, web_server_fd;
+    int server_fd, gui_server_fd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
 
@@ -117,17 +146,17 @@ int main() {
         close(server_fd);
         exit(1);
     }
-   if (listen(server_fd, 5) < 0) {
+    if (listen(server_fd, 5) < 0) {
         perror("listen");
         close(server_fd);
         exit(1);
     }
 
-    printf("Server listening on port %d...\n", PORT);
+    printf("Device server listening on port %d...\n", PORT);
 
-    // 创建Web服务器
-    web_server_fd = init_web_server();
-    if (web_server_fd < 0) {
+    // 初始化GUI服务器
+    gui_server_fd = init_gui_server();
+    if (gui_server_fd < 0) {
         close(server_fd);
         exit(1);
     }
@@ -135,28 +164,33 @@ int main() {
     // 接受设备连接
     device_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
     if (device_fd < 0) {
-        perror("accept");
+        perror("accept device");
         close(server_fd);
-        close(web_server_fd);
+        close(gui_server_fd);
         exit(1);
     }
     printf("Device connected: %s:%d\n",
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-  // 接受Web连接
-    web_fd = accept(web_server_fd, (struct sockaddr*)&client_addr, &client_len);
-    if (web_fd < 0) {
-        perror("web accept");
+
+    // 接受GUI连接
+    gui_fd = accept(gui_server_fd, (struct sockaddr*)&client_addr, &client_len);
+    if (gui_fd < 0) {
+        perror("accept gui");
         close(device_fd);
         close(server_fd);
-        close(web_server_fd);
+        close(gui_server_fd);
         exit(1);
     }
-    printf("Web client connected: %s:%d\n",
+    printf("GUI connected: %s:%d\n",
            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-    // 创建接收线程
+    // 创建接收单片机数据的线程
     pthread_t tid_recv;
     pthread_create(&tid_recv, NULL, recv_thread, &device_fd);
+
+    // 创建接收GUI数据的线程
+    pthread_t tid_gui_recv;
+    pthread_create(&tid_gui_recv, NULL, gui_recv_thread, NULL);
 
     // 主循环
     while(1) {
@@ -164,8 +198,8 @@ int main() {
     }
 
     close(device_fd);
-    close(web_fd);
+    close(gui_fd);
     close(server_fd);
-    close(web_server_fd);
+    close(gui_server_fd);
     return 0;
 }
